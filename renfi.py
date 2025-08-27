@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+cmod_fs_rename.py
+Reads a CSV and issues IBM Spectrum Protect (TSM) RENAME FILESPACE commands.
+
+Required CSV headers (exact names):
+  OD_INSTAME_SRC, AGID_NAME_SRC, OD_INSTAME_DST, AGID_NAME_DST, OD_TSM_LOGON_NAME
+
+Behavior:
+- Skips rows with empty OD_TSM_LOGON_NAME (logs them in the report)
+- Builds filespaces as "/<OD_INSTAME_SRC>/<AGID_NAME_SRC>" and "/<OD_INSTAME_DST>/<AGID_NAME_DST>"
+- Default is DRY-RUN (prints planned commands, no changes)
+- With --run: pre-checks existence, performs rename, optional --verify re-check
+- Generates a CSV report and a rollback .sh (when --run)
+
+Windows CSV note:
+- Handles CRLF seamlessly (newline='' in csv.open); trims trailing '\r' in fields.
+"""
+
+import argparse
+import csv
+import datetime as dt
+import os
+import shlex
+import subprocess
+import sys
+from getpass import getpass
+from typing import List
+
+# ----- CLI -----
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Rename Spectrum Protect filespaces based on CSV mappings."
+    )
+    p.add_argument("-c", "--csv", required=True, help="Input CSV file path")
+    p.add_argument("--servername", default="", help="dsmadmc stanza/servername")
+    p.add_argument("-u", "--user", default="", help="Admin user id")
+    p.add_argument("-p", "--passw", dest="password", default="", help="Admin password (avoid; prefer --pwfile)")
+    p.add_argument("--pwfile", default="", help="File containing admin password (single line)")
+    p.add_argument("--delim", default=",", help="CSV delimiter (default , ; use ';' for semicolon CSV)")
+    p.add_argument("--run", action="store_true", help="Apply changes (default: dry-run)")
+    p.add_argument("--verify", action="store_true", help="Re-check filespaces after rename (with --run)")
+    return p.parse_args()
+
+# ----- Utils -----
+
+def nowstamp() -> str:
+    return dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+def quote_tsm(s: str) -> str:
+    # dsmadmc expects double-quoted identifiers; inner quotes doubled
+    return '"' + s.replace('"', '""') + '"'
+
+def clean_field(s: str) -> str:
+    # Trim outer spaces/quotes and trailing CR if present
+    if s is None:
+        return ""
+    s = s.strip()
+    if len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        s = s[1:-1]
+    if s.endswith("\r"):
+        s = s[:-1]
+    return s.strip()
+
+def build_cmd(servername: str, user: str, password: str, tsm_command: str) -> List[str]:
+    args = ["dsmadmc", "-dataonly=yes", "-comma", "-noconfirm"]
+    if servername:
+        args.append(f"-servername={servername}")
+    if user:
+        args.append(f"-id={user}")
+    if password:
+        args.append(f"-password={password}")
+    args.append(tsm_command)
+    return args
+
+def run_dsmadmc(tsm_cmd: str, servername: str, user: str, password: str) -> subprocess.CompletedProcess:
+    cmd = build_cmd(servername, user, password, tsm_cmd)
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+def fs_list_for_node(node: str, servername: str, user: str, password: str) -> List[str]:
+    """Query filespaces and return list of FILESPACE_NAME values (2nd CSV column)."""
+    cp = run_dsmadmc(f"q filespace {node}", servername, user, password)
+    if cp.returncode != 0:
+        # If query fails (e.g., wrong node or auth), return empty list to let caller decide
+        return []
+    # dsmadmc -comma gives CSV; the 2nd column is FILESPACE_NAME
+    out = []
+    reader = csv.reader(cp.stdout.splitlines(), delimiter=",")
+    for row in reader:
+        if len(row) >= 2:
+            out.append(clean_field(row[1]))
+    return out
+
+def fs_exists(node: str, fsname: str, servername: str, user: str, password: str) -> bool:
+    return fsname in fs_list_for_node(node, servername, user, password)
+
+# ----- Main -----
+
+def main():
+    args = parse_args()
+
+    # Password resolution
+    password = args.password
+    if args.pwfile and not password:
+        try:
+            with open(args.pwfile, "r", encoding="utf-8") as f:
+                password = f.read().strip()
+        except Exception as e:
+            print(f"ERROR: Cannot read --pwfile: {e}", file=sys.stderr)
+            sys.exit(2)
+    if args.run and args.user and not password:
+        # Only prompt if we're going to talk to server and user is given
+        password = getpass(f"Enter password for '{args.user}': ")
+
+    # Prepare outputs
+    stamp = nowstamp()
+    report_path = f"fs_rename_report_{stamp}.csv"
+    rollback_path = f"fs_rollback_{stamp}.sh"
+
+    # Init report
+    with open(report_path, "w", newline="", encoding="utf-8") as rep:
+        rep_writer = csv.writer(rep)
+        rep_writer.writerow(["node", "old_fs", "new_fs", "action", "status", "message"])
+
+    # Init rollback (only meaningful for --run, but generujemy od razu)
+    with open(rollback_path, "w", encoding="utf-8") as rb:
+        rb.write("#!/usr/bin/env bash\n")
+        rb.write("# Rollback script generated by cmod_fs_rename.py\n")
+        rb.write("# Each line renames filespace back to its original value\n\n")
+    os.chmod(rollback_path, 0o755)
+
+    # Read CSV (newline='' to handle CRLF cleanly)
+    required = ["OD_INSTAME_SRC", "AGID_NAME_SRC", "OD_INSTAME_DST", "AGID_NAME_DST", "OD_TSM_LOGON_NAME"]
+    line_num = 0
+    try:
+        with open(args.csv, "r", newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f, delimiter=args.delim)
+            # Validate headers
+            missing = [h for h in required if h not in reader.fieldnames]
+            if missing:
+                print(f"ERROR: CSV missing required headers: {', '.join(missing)}", file=sys.stderr)
+                sys.exit(4)
+
+            for row in reader:
+                line_num += 1
+                node = clean_field(row.get("OD_TSM_LOGON_NAME", ""))
+                if not node:
+                    # Record skipped row
+                    with open(report_path, "a", newline="", encoding="utf-8") as rep:
+                        csv.writer(rep).writerow(["", "", "", "skip", "SKIPPED", "OD_TSM_LOGON_NAME empty"])
+                    continue
+
+                src_inst = clean_field(row.get("OD_INSTAME_SRC", ""))
+                src_agid = clean_field(row.get("AGID_NAME_SRC", ""))
+                dst_inst = clean_field(row.get("OD_INSTAME_DST", ""))
+                dst_agid = clean_field(row.get("AGID_NAME_DST", ""))
+
+                old_fs = f"/{src_inst}/{src_agid}"
+                new_fs = f"/{dst_inst}/{dst_agid}"
+
+                # Planned command
+                tsm_cmd = f"rename filespace {node} {quote_tsm(old_fs)} {quote_tsm(new_fs)}"
+
+                if not args.run:
+                    print(f"INFO : [DRY] {tsm_cmd}", file=sys.stderr)
+                    with open(report_path, "a", newline="", encoding="utf-8") as rep:
+                        csv.writer(rep).writerow([node, old_fs, new_fs, "rename", "DRY-RUN", "No changes applied"])
+                    continue
+
+                # --run path: pre-checks
+                if not fs_exists(node, old_fs, args.servername, args.user, password):
+                    with open(report_path, "a", newline="", encoding="utf-8") as rep:
+                        csv.writer(rep).writerow([node, old_fs, new_fs, "rename", "SKIPPED", "old_fs not found"])
+                    continue
+
+                if fs_exists(node, new_fs, args.servername, args.user, password):
+                    with open(report_path, "a", newline="", encoding="utf-8") as rep:
+                        csv.writer(rep).writerow([node, old_fs, new_fs, "rename", "SKIPPED", "new_fs already exists"])
+                    continue
+
+                # Execute rename
+                print(f"INFO : Executing: {tsm_cmd}", file=sys.stderr)
+                cp = run_dsmadmc(tsm_cmd, args.servername, args.user, password)
+                if cp.returncode != 0:
+                    msg = (cp.stderr or cp.stdout or "").replace("\n", " ").replace(",", ";")
+                    with open(report_path, "a", newline="", encoding="utf-8") as rep:
+                        csv.writer(rep).writerow([node, old_fs, new_fs, "rename", "FAILED", msg])
+                    continue
+
+                status = "OK"
+                msg = "renamed"
+
+                # Optional verification
+                if args.verify:
+                    ok_new = fs_exists(node, new_fs, args.servername, args.user, password)
+                    ok_old = fs_exists(node, old_fs, args.servername, args.user, password)
+                    if ok_new and not ok_old:
+                        msg += "; verified"
+                    else:
+                        status = "WARN"
+                        msg += "; verification mismatch"
+
+                # Report success
+                with open(report_path, "a", newline="", encoding="utf-8") as rep:
+                    csv.writer(rep).writerow([node, old_fs, new_fs, "rename", status, msg])
+
+                # Rollback entry (only if we actually changed something)
+                if status in ("OK", "WARN"):
+                    with open(rollback_path, "a", encoding="utf-8") as rb:
+                        rb.write(f"rename filespace {node} {quote_tsm(new_fs)} {quote_tsm(old_fs)}\n")
+
+    except FileNotFoundError:
+        print(f"ERROR: CSV not readable: {args.csv}", file=sys.stderr)
+        sys.exit(2)
+
+    print(f"INFO : Done. Report: {report_path}", file=sys.stderr)
+    if args.run:
+        print(f"INFO : Rollback script: {rollback_path}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()
