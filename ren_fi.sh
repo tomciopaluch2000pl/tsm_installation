@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# cmod_fs_rename.sh
+# Build and run RENAME FILESPACE commands for IBM Spectrum Protect based on a CSV.
+#
+# Required CSV headers (case-sensitive as delivered to you):
+#   OD_INSTAME_SRC, AGID_NAME_SRC, OD_INSTAME_DST, AGID_NAME_DST, OD_TSM_LOGON_NAME
+#
+# The script:
+#  - skips rows where OD_TSM_LOGON_NAME is empty (CMOD used only cache),
+#  - still records them in the report with SKIPPED status,
+#  - builds current/new filespace as: "/<OD_INSTAME_SRC>/<AGID_NAME_SRC>" and "/<OD_INSTAME_DST>/<AGID_NAME_DST>",
+#  - runs: rename filespace <node> "<old_fs>" "<new_fs>"
+#
+# Usage:
+#   ./cmod_fs_rename.sh -c data.csv [--servername STANZA] [-u ADMIN] [-p PASS|--pwfile FILE] \
+#       [--delim ';'] [--run] [--verify]
+#
+# Notes:
+#   - By default it's DRY-RUN (prints what would be executed). Use --run to apply.
+#   - --verify will check filespaces after rename.
+#   - Output report: ./fs_rename_report_YYYYmmdd_HHMMSS.csv
+
+SERVERNAME=""
+ADMIN_USER=""
+ADMIN_PASS=""
+PWFILE=""
+CSV_FILE=""
+DELIM=","
+DO_RUN=0
+VERIFY=0
+
+usage() {
+  sed -n '2,80p' "$0" | sed 's/^# \{0,1\}//'
+  exit 1
+}
+
+err()  { echo "ERROR: $*" >&2; }
+info() { echo "INFO : $*" >&2; }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -c|--csv)      CSV_FILE="$2"; shift 2;;
+    --servername)  SERVERNAME="$2"; shift 2;;
+    -u|--user)     ADMIN_USER="$2"; shift 2;;
+    -p|--pass)     ADMIN_PASS="${2-}"; shift 2;;
+    --pwfile)      PWFILE="$2"; shift 2;;
+    --delim)       DELIM="$2"; shift 2;;
+    --run)         DO_RUN=1; shift;;
+    --verify)      VERIFY=1; shift;;
+    -h|--help)     usage;;
+    *) err "Unknown arg: $1"; usage;;
+  esac
+done
+
+[[ -n "$CSV_FILE" ]] || { err "Missing -c|--csv"; usage; }
+[[ -r "$CSV_FILE" ]] || { err "CSV not readable: $CSV_FILE"; exit 2; }
+
+# Resolve password
+if [[ -n "$PWFILE" ]]; then
+  [[ -r "$PWFILE" ]] || { err "Password file not readable: $PWFILE"; exit 2; }
+  ADMIN_PASS="$(<"$PWFILE")"
+fi
+if [[ -z "${ADMIN_PASS}" && -n "$ADMIN_USER" ]]; then
+  read -r -s -p "Enter password for '$ADMIN_USER': " ADMIN_PASS
+  echo
+fi
+
+# dsmadmc wrapper
+command -v dsmadmc >/dev/null 2>&1 || { err "dsmadmc not found in PATH"; exit 3; }
+run_dsmadmc() {
+  local cmd="$1"
+  # -noconfirm to skip any Yes/No prompts
+  local args=(-dataonly=yes -comma -noconfirm)
+  [[ -n "$SERVERNAME" ]] && args+=(-servername="$SERVERNAME")
+  [[ -n "$ADMIN_USER"  ]] && args+=(-id="$ADMIN_USER")
+  [[ -n "$ADMIN_PASS"  ]] && args+=(-password="$ADMIN_PASS")
+  dsmadmc "${args[@]}" "$cmd"
+}
+
+# Helpers
+q() { local s="${1//\"/\"\"}"; printf '"%s"' "$s"; }
+timestamp(){ date +"%Y%m%d_%H%M%S"; }
+REPORT="fs_rename_report_$(timestamp).csv"
+echo 'node,old_fs,new_fs,action,status,message' > "$REPORT"
+
+# Read header and find column indexes
+header_raw="$(head -n1 "$CSV_FILE")"
+IFS="$DELIM" read -r -a hdr_arr <<< "$header_raw"
+
+norm() { echo "$1" | tr -d '"' | tr -d '[:space:]'; }
+
+idx_src_inst=-1
+idx_src_agid=-1
+idx_dst_inst=-1
+idx_dst_agid=-1
+idx_node=-1
+
+for i in "${!hdr_arr[@]}"; do
+  col="$(norm "${hdr_arr[$i]}")"
+  case "$col" in
+    OD_INSTAME_SRC)    idx_src_inst=$i;;
+    AGID_NAME_SRC)     idx_src_agid=$i;;
+    OD_INSTAME_DST)    idx_dst_inst=$i;;
+    AGID_NAME_DST)     idx_dst_agid=$i;;
+    OD_TSM_LOGON_NAME) idx_node=$i;;
+  esac
+done
+
+if (( idx_src_inst<0 || idx_src_agid<0 || idx_dst_inst<0 || idx_dst_agid<0 || idx_node<0 )); then
+  err "CSV header must include: OD_INSTAME_SRC, AGID_NAME_SRC, OD_INSTAME_DST, AGID_NAME_DST, OD_TSM_LOGON_NAME"
+  exit 4
+fi
+
+# CSV-safe splitter
+split_csv_line() {
+  local line="$1" d="$DELIM"
+  awk -v d="$d" '
+    BEGIN{FS=""; OFS="|"; inq=0; field=""; out=""}
+    {
+      for(i=1;i<=NF;i++){
+        ch=$i
+        if(ch=="\""){
+          if(inq && (i<NF) && $(i+1)=="\""){ field=field "\""; i++ } else { inq=1-inq }
+        } else if(ch==d && inq==0) {
+          out = (out=="" ? field : out OFS field); field=""
+        } else {
+          field=field ch
+        }
+      }
+      out = (out=="" ? field : out OFS field)
+      print out
+    }' <<< "$line"
+}
+
+# Spectrum checks
+list_filespaces() {
+  local node="$1"
+  run_dsmadmc "q filespace ${node}" | awk -F',' 'NF>1{gsub(/^"|"$/,"",$2); print $2}'
+}
+fs_exists() {
+  local node="$1" fs="$2"
+  list_filespaces "$node" | awk -v t="$fs" 'BEGIN{f=0} {if($0==t) f=1} END{exit !f}'
+}
+
+tail -n +2 "$CSV_FILE" | while IFS= read -r line; do
+  [[ -z "${line//[[:space:]]/}" ]] && continue
+  [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+  parsed="$(split_csv_line "$line")"
+  IFS="|" read -r -a arr <<< "$parsed"
+
+  trim() { echo "$1" | sed 's/^ *//; s/ *$//; s/^"//; s/"$//' ; }
+
+  node="$(trim "${arr[$idx_node]}")"
+  if [[ -z "$node" ]]; then
+    echo ",,,skip,SKIPPED,OD_TSM_LOGON_NAME empty" >> "$REPORT"
+    continue
+  fi
+
+  src_inst="$(trim "${arr[$idx_src_inst]}")"
+  src_agid="$(trim "${arr[$idx_src_agid]}")"
+  dst_inst="$(trim "${arr[$idx_dst_inst]}")"
+  dst_agid="$(trim "${arr[$idx_dst_agid]}")"
+
+  old_fs="/${src_inst}/${src_agid}"
+  new_fs="/${dst_inst}/${dst_agid}"
+
+  cmd="rename filespace ${node} $(q "$old_fs") $(q "$new_fs")"
+
+  if (( DO_RUN==0 )); then
+    info "[DRY] $cmd"
+    echo "$node,$old_fs,$new_fs,rename,DRY-RUN,No changes applied" >> "$REPORT"
+    continue
+  fi
+
+  if ! fs_exists "$node" "$old_fs"; then
+    echo "$node,$old_fs,$new_fs,rename,SKIPPED,old_fs not found" >> "$REPORT"
+    continue
+  fi
+  if fs_exists "$node" "$new_fs"; then
+    echo "$node,$old_fs,$new_fs,rename,SKIPPED,new_fs already exists" >> "$REPORT"
+    continue
+  fi
+
+  info "Executing: $cmd"
+  if out=$(run_dsmadmc "$cmd" 2>&1); then
+    status="OK"; msg="renamed"
+  else
+    status="FAILED"; msg="$(echo "$out" | tr '\n' ' ' | sed 's/,/;/g')"
+    echo "$node,$old_fs,$new_fs,rename,$status,$msg" >> "$REPORT"
+    continue
+  fi
+
+  if (( VERIFY )); then
+    if fs_exists "$node" "$new_fs" && ! fs_exists "$node" "$old_fs"; then
+      msg="$msg; verified"
+    else
+      status="WARN"; msg="$msg; verification mismatch"
+    fi
+  fi
+
+  echo "$node,$old_fs,$new_fs,rename,$status,$msg" >> "$REPORT"
+done
+
+info "Done. Report: $REPORT"
