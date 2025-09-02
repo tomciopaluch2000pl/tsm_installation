@@ -1,0 +1,194 @@
+#!/usr/bin/env perl
+# =============================================================================
+#  Script Name : compare_fs.pl
+#  Purpose     : Compare values from two files (a simple log and a CSV map)
+#                and produce an investigation report.
+#
+#  Description :
+#    - INPUT 1 (log): each line contains two comma-separated columns:
+#         1) od_tsm_logon_name
+#         2) filespace path like /INSTAME/AGID   (backslashes are allowed)
+#      We extract:
+#         - INSTAME_SRC  -> first segment after the slash
+#         - AGID_NAME_SRC-> second segment after the slash
+#
+#    - INPUT 2 (CSV): has a header; must include columns (any order):
+#         INSTAME_SRC, AGID_NAME_SRC, OD_TSM_LOGON_NAME
+#
+#    - OUTPUT (report): fs_investigation.log
+#         * If all three fields match -> write the entire CSV row + ",found"
+#         * If INSTAME_SRC & AGID_NAME_SRC match but OD_TSM_LOGON_NAME differs
+#             -> write the CSV row + ",od_tsm_logon_name differs in log:<VALUE_FROM_LOG>"
+#         * If the pair (INSTAME_SRC, AGID_NAME_SRC) is not present in the CSV
+#             -> write the original log line + ",not_found_in_csv"
+#
+#  Notes       :
+#    - Matching is case-insensitive and trimmed.
+#    - Backslashes in the log path are treated as slashes.
+#    - The script tries to use Text::CSV_XS (if installed); otherwise it falls
+#      back to a simple split on commas (sufficient for “plain” CSV lines).
+#
+#  Platform    : RHEL 8 (Perl 5.x)
+#  Dependencies: Optional: Text::CSV_XS
+#
+#  Usage       :
+#       perl compare_fs.pl fs_not_changed.log GERA_RAR_TSM_FILESPACEMAP.csv fs_investigation.log
+#
+#  Exit Codes  :
+#       0 - success
+#       1 - usage or file/format error
+#
+#  Author      : <your name>
+#  Version     : 1.1
+#  Last Change : 2025-09-02
+#  Change Log  :
+#       1.1 - English rewrite, standardized header.
+#       1.0 - Initial version (PL).
+# =============================================================================
+
+use strict;
+use warnings;
+use utf8;
+
+my ($log_file, $csv_file, $out_file) = @ARGV;
+if (!$log_file || !$csv_file || !$out_file) {
+    die "Usage: perl $0 <fs_not_changed.log> <map.csv> <fs_investigation.log>\n";
+}
+
+# --- Try to load Text::CSV_XS if available -----------------------------------
+my $HAS_CSV = 0;
+my ($csv_obj);
+eval {
+    require Text::CSV_XS;
+    Text::CSV_XS->import();
+    $csv_obj = Text::CSV_XS->new({ binary => 1, auto_diag => 1 });
+    $HAS_CSV = 1;
+    1;
+};
+
+# --- Read CSV into memory; index by (INSTAME_SRC, AGID_NAME_SRC) -------------
+open my $CSV, "<:encoding(UTF-8)", $csv_file
+  or die "Cannot open CSV '$csv_file': $!";
+
+my @csv_header;
+my %idx;  # column-name (UC) -> index
+
+if ($HAS_CSV) {
+    my $row = $csv_obj->getline($CSV) or die "Empty CSV or missing header\n";
+    @csv_header = @$row;
+} else {
+    my $hdr = <$CSV>;
+    defined $hdr or die "Empty CSV or missing header\n";
+    chomp $hdr;
+    @csv_header = split /,/, $hdr, -1;
+}
+
+for my $i (0..$#csv_header) {
+    my $name = uc _clean($csv_header[$i]);
+    $idx{$name} = $i;
+}
+
+for my $need (qw/INSTAME_SRC AGID_NAME_SRC OD_TSM_LOGON_NAME/) {
+    die "CSV is missing required column '$need'\n" unless exists $idx{$need};
+}
+
+# by_pair{ "inst|agid" } = [ { row => raw_csv_line, vals => {...} }, ... ]
+my %by_pair;
+while ( my $line = <$CSV> ) {
+    chomp $line;
+    my @cols;
+    if ($HAS_CSV) {
+        next unless $csv_obj->parse($line);
+        @cols = $csv_obj->fields();
+    } else {
+        @cols = split /,/, $line, -1;
+    }
+
+    my $inst = _get_cell(\@cols, \%idx, 'INSTAME_SRC');
+    my $agid = _get_cell(\@cols, \%idx, 'AGID_NAME_SRC');
+    my $odln = _get_cell(\@cols, \%idx, 'OD_TSM_LOGON_NAME');
+
+    my $key = _key_pair($inst, $agid);
+    push @{ $by_pair{$key} }, {
+        row  => $line,
+        vals => {
+            INSTAME_SRC      => $inst,
+            AGID_NAME_SRC    => $agid,
+            OD_TSM_LOGON_NAME=> $odln,
+        },
+    };
+}
+close $CSV;
+
+# --- Process the log and create the report -----------------------------------
+open my $LOG, "<:encoding(UTF-8)", $log_file
+  or die "Cannot open log '$log_file': $!";
+open my $OUT, ">:encoding(UTF-8)", $out_file
+  or die "Cannot open output '$out_file': $!";
+
+while ( my $l = <$LOG> ) {
+    chomp $l;
+    next if $l =~ /^\s*$/;
+
+    # Expect: od_tsm_logon_name, /INSTAME/AGID   (allow '\' as well)
+    my ($od_tsm_logon_name, $fs_path) = split /,/, $l, 2;
+    $od_tsm_logon_name = _clean($od_tsm_logon_name // '');
+    $fs_path           = $fs_path // '';
+
+    $fs_path =~ s/\\/\//g;     # treat backslashes as slashes
+    $fs_path =~ s/^\s*\/+//;   # trim leading slashes/spaces
+    $fs_path =~ s/\/+\s*$//;   # trim trailing slashes/spaces
+    my ($instame_src, $agid_name_src) = split /\//, $fs_path, 3; # take first two segments
+    $instame_src   = _clean($instame_src // '');
+    $agid_name_src = _clean($agid_name_src // '');
+
+    my $key = _key_pair($instame_src, $agid_name_src);
+
+    if ( exists $by_pair{$key} ) {
+        # Perfect 3-field match?
+        my ($exact) = grep {
+            _eq_norm($_->{vals}{'OD_TSM_LOGON_NAME'}, $od_tsm_logon_name)
+        } @{ $by_pair{$key} };
+
+        if ($exact) {
+            print $OUT $exact->{row} . ",found\n";
+        } else {
+            # Pair matches, but od_tsm_logon_name differs
+            my $some = $by_pair{$key}[0];
+            print $OUT $some->{row} . ",od_tsm_logon_name differs in log:$od_tsm_logon_name\n";
+        }
+    } else {
+        # Pair not present in CSV
+        print $OUT $l . ",not_found_in_csv\n";
+    }
+}
+
+close $LOG;
+close $OUT;
+
+# ------------------------------- Helpers --------------------------------------
+
+sub _clean {
+    my ($s) = @_;
+    $s //= '';
+    $s =~ s/^\s+//;
+    $s =~ s/\s+$//;
+    return $s;
+}
+
+sub _key_pair {
+    my ($inst, $agid) = @_;
+    return lc(_clean($inst)) . '|' . lc(_clean($agid));
+}
+
+sub _eq_norm {
+    my ($a, $b) = @_;
+    return lc(_clean($a)) eq lc(_clean($b));
+}
+
+sub _get_cell {
+    my ($aref, $idxref, $name_uc) = @_;
+    my $i = $idxref->{$name_uc};
+    return '' if !defined $i;
+    return defined $aref->[$i] ? _clean($aref->[$i]) : '';
+}
