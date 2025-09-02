@@ -1,0 +1,340 @@
+#!/usr/bin/env perl
+# =============================================================================
+#  Script Name : compare_fs.pl
+#  Purpose     : Compare values from two files (a simple log and a CSV map)
+#                and produce:
+#                  - investigation report (per-line results),
+#                  - summary stats (including mismatch breakdown),
+#                  - a CSV with all correctly found rows (original CSV format),
+#                  - a CSV with duplicate rows in the original CSV (by 3-field key).
+#
+#  Description :
+#    - INPUT 1 (log): each line contains two comma-separated columns:
+#         1) od_tsm_logon_name
+#         2) filespace path like /INSTAME/AGID   (backslashes are allowed)
+#      We extract:
+#         - INSTAME_SRC   -> first segment after the slash
+#         - AGID_NAME_SRC -> second segment after the slash
+#
+#    - INPUT 2 (CSV): has a header; must include columns (any order):
+#         INSTAME_SRC, AGID_NAME_SRC, OD_TSM_LOGON_NAME
+#
+#    - OUTPUTS:
+#         1) fs_investigation.log
+#              * If all three fields match -> CSV row + ",found"
+#              * If pair matches but OD_TSM_LOGON_NAME differs
+#                    -> CSV row + ",od_tsm_logon_name differs in log:<VALUE_FROM_LOG>"
+#              * If pair not present in CSV -> original log line + ",not_found_in_csv"
+#         2) fs_investigation.log.summary.txt
+#              - overall stats + mismatch breakdown by expected OD_TSM_LOGON_NAME
+#              - CSV duplicate stats (groups & rows)
+#         3) fs_investigation.log.found.csv
+#              - original CSV header + all (unique) CSV rows that matched perfectly
+#         4) fs_investigation.log.csv_duplicates.csv
+#              - original CSV header + all rows that belong to duplicate keys in CSV
+#                (key = OD_TSM_LOGON_NAME + INSTAME_SRC + AGID_NAME_SRC)
+#
+#  Notes       :
+#    - Matching is case-insensitive and trimmed.
+#    - Backslashes in the log path are treated as slashes.
+#    - Prefers Text::CSV_XS (if installed); otherwise falls back to simple split.
+#    - Files are opened in :raw mode to avoid UTF-8 decoding issues.
+#
+#  Platform    : RHEL 8 (Perl 5.x)
+#  Dependencies: Optional: Text::CSV_XS
+#
+#  Usage       :
+#       perl compare_fs.pl fs_not_changed.log GERA_RAR_TSM_FILESPACEMAP.csv fs_investigation.log
+#
+#  Exit Codes  :
+#       0 - success
+#       1 - usage or file/format error
+#
+#  Author      : <your name>
+#  Version     : 1.6
+#  Last Change : 2025-09-02
+#  Change Log  :
+#       1.6 - Detect and export duplicate rows from original CSV (by 3-field key).
+#       1.5 - Added <output>.found.csv (unique fully-matched rows).
+#       1.4 - Mismatch breakdown grouped by expected OD_TSM_LOGON_NAME (CSV).
+#       1.3 - Summary stats file.
+#       1.2 - Use :raw for IO, strip CRs.
+#       1.1 - English rewrite, standardized header.
+#       1.0 - Initial version.
+# =============================================================================
+
+use strict;
+use warnings;
+use utf8;
+
+my ($log_file, $csv_file, $out_file) = @ARGV;
+if (!$log_file || !$csv_file || !$out_file) {
+    die "Usage: perl $0 <fs_not_changed.log> <map.csv> <fs_investigation.log>\n";
+}
+
+# --- Try to load Text::CSV_XS if available -----------------------------------
+my $HAS_CSV = 0;
+my ($csv_obj);
+eval {
+    require Text::CSV_XS;
+    Text::CSV_XS->import();
+    $csv_obj = Text::CSV_XS->new({ binary => 1, auto_diag => 1 });
+    $HAS_CSV = 1;
+    1;
+};
+
+# --- Read CSV into memory; index by (INSTAME_SRC, AGID_NAME_SRC) -------------
+open my $CSV, "<:raw", $csv_file
+  or die "Cannot open CSV '$csv_file': $!";
+
+my @csv_header;
+my %idx;  # column-name (UC) -> index
+
+if ($HAS_CSV) {
+    my $row = $csv_obj->getline($CSV) or die "Empty CSV or missing header\n";
+    @csv_header = @$row;
+} else {
+    my $hdr = <$CSV>;
+    defined $hdr or die "Empty CSV or missing header\n";
+    chomp $hdr;
+    $hdr =~ s/\r$//;                # strip Windows CR if present
+    @csv_header = split /,/, $hdr, -1;
+}
+
+for my $i (0..$#csv_header) {
+    my $name = uc _clean($csv_header[$i]);
+    $idx{$name} = $i;
+}
+
+for my $need (qw/INSTAME_SRC AGID_NAME_SRC OD_TSM_LOGON_NAME/) {
+    die "CSV is missing required column '$need'\n" unless exists $idx{$need};
+}
+
+# Maps from CSV
+# by_pair{ "inst|agid" } -> array of rows (for matching against the log)
+my %by_pair;
+# For duplicate detection by full triple key
+# triple_rows{ "od|inst|agid" } -> array of raw CSV lines
+my %triple_rows;
+
+while ( my $line = <$CSV> ) {
+    chomp $line;
+    $line =~ s/\r$//;               # strip Windows CR if present
+
+    my @cols;
+    if ($HAS_CSV) {
+        next unless $csv_obj->parse($line);
+        @cols = $csv_obj->fields();
+    } else {
+        @cols = split /,/, $line, -1;
+    }
+
+    my $inst = _get_cell(\@cols, \%idx, 'INSTAME_SRC');
+    my $agid = _get_cell(\@cols, \%idx, 'AGID_NAME_SRC');
+    my $odln = _get_cell(\@cols, \%idx, 'OD_TSM_LOGON_NAME');
+
+    my $pair_key   = _pair_key($inst, $agid);
+    my $triple_key = _triple_key($odln, $inst, $agid);
+
+    push @{ $by_pair{$pair_key} }, {
+        row  => $line,
+        vals => {
+            INSTAME_SRC       => $inst,
+            AGID_NAME_SRC     => $agid,
+            OD_TSM_LOGON_NAME => $odln,
+        },
+    };
+
+    push @{ $triple_rows{$triple_key} }, $line;
+}
+close $CSV;
+
+# --- Process the log and create outputs --------------------------------------
+open my $LOG,   "<:raw", $log_file  or die "Cannot open log '$log_file': $!";
+open my $OUT,   ">:raw", $out_file  or die "Cannot open output '$out_file': $!";
+
+# found.csv
+my $found_csv = $out_file . ".found.csv";
+open my $FOUND, ">:raw", $found_csv or die "Cannot open found-csv '$found_csv': $!";
+print $FOUND join(',', @csv_header) . "\n";
+
+# duplicates csv
+my $dups_csv = $out_file . ".csv_duplicates.csv";
+open my $DUPS, ">:raw", $dups_csv or die "Cannot open duplicates-csv '$dups_csv': $!";
+print $DUPS join(',', @csv_header) . "\n";
+
+my %stats = (
+    found                       => 0,
+    od_tsm_logon_name_differs   => 0,
+    not_found_in_csv            => 0,
+    total_lines                 => 0,
+);
+
+# breakdown maps
+my %mismatch_by_expected;         # expected_od -> count
+my %mismatch_expected_vs_log;     # expected_od -> { log_od -> count }
+my %found_row_dedup;              # seen raw CSV row -> 1
+
+# Process log
+while ( my $l = <$LOG> ) {
+    chomp $l;
+    $l =~ s/\r$//;
+    next if $l =~ /^\s*$/;
+
+    $stats{total_lines}++;
+
+    my ($od_tsm_logon_name, $fs_path) = split /,/, $l, 2;
+    $od_tsm_logon_name = _clean($od_tsm_logon_name // '');
+    $fs_path           = $fs_path // '';
+
+    $fs_path =~ s/\\/\//g;
+    $fs_path =~ s/^\s*\/+//;
+    $fs_path =~ s/\/+\s*$//;
+    my ($instame_src, $agid_name_src) = split /\//, $fs_path, 3;
+    $instame_src   = _clean($instame_src // '');
+    $agid_name_src = _clean($agid_name_src // '');
+
+    my $pair_key = _pair_key($instame_src, $agid_name_src);
+
+    if ( exists $by_pair{$pair_key} ) {
+        my ($exact) = grep {
+            _eq_norm($_->{vals}{'OD_TSM_LOGON_NAME'}, $od_tsm_logon_name)
+        } @{ $by_pair{$pair_key} };
+
+        if ($exact) {
+            print $OUT $exact->{row} . ",found\n";
+            $stats{found}++;
+
+            my $raw = $exact->{row};
+            if (!$found_row_dedup{$raw}++) {
+                print $FOUND $raw . "\n";
+            }
+        } else {
+            my $some     = $by_pair{$pair_key}[0];
+            my $expected = $some->{vals}{'OD_TSM_LOGON_NAME'};
+            print $OUT $some->{row} . ",od_tsm_logon_name differs in log:$od_tsm_logon_name\n";
+            $stats{od_tsm_logon_name_differs}++;
+            $mismatch_by_expected{$expected}++;
+            $mismatch_expected_vs_log{$expected}{ $od_tsm_logon_name }++;
+        }
+    } else {
+        print $OUT $l . ",not_found_in_csv\n";
+        $stats{not_found_in_csv}++;
+    }
+}
+close $LOG;
+close $OUT;
+close $FOUND;
+
+# --- Emit duplicates CSV from original CSV content ---------------------------
+# We include all rows for keys that appear more than once.
+my $dup_groups = 0;
+my $dup_rows   = 0;
+for my $k ( keys %triple_rows ) {
+    my $rows = $triple_rows{$k} || [];
+    if (@$rows > 1) {
+        $dup_groups++;
+        $dup_rows += scalar(@$rows);
+        print $DUPS join("\n", @$rows) . "\n";
+    }
+}
+close $DUPS;
+
+# --- Write summary file -------------------------------------------------------
+my $summary_file = $out_file . ".summary.txt";
+open my $SUM, ">:raw", $summary_file
+  or die "Cannot open summary '$summary_file': $!";
+
+my $ts = scalar localtime();
+print $SUM <<"SUMMARY1";
+Investigation Summary
+=====================
+Timestamp      : $ts
+Input (log)    : $log_file
+Input (csv)    : $csv_file
+Output (report): $out_file
+Output (found) : $found_csv
+CSV Duplicates : $dups_csv
+
+Overall Stats (counts and % of total lines)
+Type,Count,Percent
+found,$stats{found},@{[ _pct($stats{found}, $stats{total_lines}) ]}
+od_tsm_logon_name_differs,$stats{od_tsm_logon_name_differs},@{[ _pct($stats{od_tsm_logon_name_differs}, $stats{total_lines}) ]}
+not_found_in_csv,$stats{not_found_in_csv},@{[ _pct($stats{not_found_in_csv}, $stats{total_lines}) ]}
+total_lines,$stats{total_lines},100.00
+
+CSV Duplicate Stats (by OD_TSM_LOGON_NAME + INSTAME_SRC + AGID_NAME_SRC)
+duplicate_groups,$dup_groups
+duplicate_rows,$dup_rows
+
+SUMMARY1
+
+if ($stats{od_tsm_logon_name_differs} > 0) {
+    print $SUM "Mismatch breakdown by expected OD_TSM_LOGON_NAME (from CSV)\n";
+    print $SUM "----------------------------------------------------------------\n";
+    print $SUM "Expected_OD,Count,Percent_of_Mismatches\n";
+
+    for my $expected ( sort { ($mismatch_by_expected{$b}||0) <=> ($mismatch_by_expected{$a}||0) || lc($a) cmp lc($b) } keys %mismatch_by_expected ) {
+        my $cnt = $mismatch_by_expected{$expected} || 0;
+        printf $SUM "%s,%d,%.2f\n", $expected, $cnt, _pct($cnt, $stats{od_tsm_logon_name_differs});
+        my $inner = $mismatch_expected_vs_log{$expected} || {};
+        if (%$inner) {
+            print $SUM "  log_values_for_expected:\n";
+            for my $log_od ( sort { $$inner{$b} <=> $$inner{$a} || lc($a) cmp lc($b) } keys %$inner ) {
+                printf $SUM "    - %s: %d\n", $log_od, $$inner{$log_od};
+            }
+        }
+    }
+    print $SUM "\n";
+} else {
+    print $SUM "No mismatches to breakdown by expected OD_TSM_LOGON_NAME.\n\n";
+}
+
+close $SUM;
+
+# Console note
+warn sprintf(
+    "Summary: found=%d, differs=%d, not_found=%d, total=%d | CSV dup groups=%d rows=%d -> %s ; found csv -> %s ; dups csv -> %s\n",
+    @stats{qw/found od_tsm_logon_name_differs not_found_in_csv total_lines/},
+    $dup_groups, $dup_rows, $summary_file, $found_csv, $dups_csv
+);
+
+exit 0;
+
+# ------------------------------- Helpers --------------------------------------
+
+sub _clean {
+    my ($s) = @_;
+    $s //= '';
+    $s =~ s/^\s+//;
+    $s =~ s/\s+$//;
+    return $s;
+}
+
+sub _pair_key {
+    my ($inst, $agid) = @_;
+    return lc(_clean($inst)) . '|' . lc(_clean($agid));
+}
+
+sub _triple_key {
+    my ($od, $inst, $agid) = @_;
+    return lc(_clean($od)) . '|' . lc(_clean($inst)) . '|' . lc(_clean($agid));
+}
+
+sub _eq_norm {
+    my ($a, $b) = @_;
+    return lc(_clean($a)) eq lc(_clean($b));
+}
+
+sub _get_cell {
+    my ($aref, $idxref, $name_uc) = @_;
+    my $i = $idxref->{$name_uc};
+    return '' if !defined $i;
+    return defined $aref->[$i] ? _clean($aref->[$i]) : '';
+}
+
+sub _pct {
+    my ($x, $total) = @_;
+    return 0 if !$total;
+    return sprintf("%.2f", ($x*100.0)/$total);
+}
