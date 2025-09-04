@@ -1,0 +1,28 @@
+# =====================================================================
+#  USAGE
+#
+#  Preview only (no macros executed):
+#    perl sp_rename_nodes.pl \
+#      --id ADMIN --pass PASSWORD --server SERVERNAME \
+#      --prefix N1 --preview
+#
+#  Generate macros & reports, but do not execute:
+#    perl sp_rename_nodes.pl \
+#      --id ADMIN --pass PASSWORD --server SERVERNAME \
+#      --prefix N1 --no-exec
+#
+#  Execute renames and updates in one session:
+#    perl sp_rename_nodes.pl \
+#      --id ADMIN --pass PASSWORD --server SERVERNAME \
+#      --prefix N1
+#
+#  Rollback (restore original names, keep SESSIONSECURITY=TRANSITIONAL):
+#    dsmadmc -id=ADMIN -password=PASSWORD -se=SERVERNAME -noc \
+#      "macro rollback_YYYYMMDD_HHMMSS.mac"
+#
+#  Notes:
+#    --prefix can be given as "N1" or "N1-" (script normalizes to N1-)
+#    --upper forces new names to uppercase
+#    --only-regex / --exclude-regex to filter nodes
+#    --skip-prefixed (default) skips already prefixed nodes
+# =====================================================================
